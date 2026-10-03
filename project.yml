@@ -1,0 +1,64 @@
+name: Awake
+options:
+  bundleIdPrefix: com.mohdkhan
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    DEVELOPMENT_TEAM: NVG52GHW92
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEAD_CODE_STRIPPING: YES
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+targets:
+  Awake:
+    type: application
+    platform: macOS
+    sources:
+      - App
+      - Shared
+      - path: sudoers.d/awake
+        buildPhase: resources
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Awake
+        LSUIElement: true
+        LSApplicationCategoryType: public.app-category.utilities
+        CFBundleURLTypes:
+          - CFBundleURLName: com.mohdkhan.awake
+            CFBundleURLSchemes: [com.mohdkhan.awake]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mohdkhan.awake
+    dependencies:
+      - target: AwakeControl
+  AwakeControl:
+    type: app-extension
+    platform: macOS
+    sources:
+      - Control
+      - Shared
+    info:
+      path: Control/Info.plist
+      properties:
+        CFBundleDisplayName: Awake
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    entitlements:
+      path: Control/AwakeControl.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.temporary-exception.files.home-relative-path.read-write:
+          - /.cache/awake/
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mohdkhan.awake.control
+schemes:
+  Awake:
+    build:
+      targets:
+        Awake: all

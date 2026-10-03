@@ -1,0 +1,632 @@
+#!/bin/zsh -f
+#
+# awake: keep this Mac awake, lid closed included.
+#
+#   awake                on until `asleep`
+#   awake 45m            on for a while: 90s, 45m, 2h, 1h30m (a bare number is minutes)
+#   awake -- cmd [arg…]  on while cmd runs, then exit with its status
+#   asleep, awake stop   off: stop caffeinate and restore lid sleep
+#   awake status         what's going on
+#   awake is-on          exit status only: 0 on, 1 off
+#
+# caffeinate alone only blocks idle sleep; closing the lid still sleeps the Mac
+# and drops Wi-Fi. So awake also sets `pmset -a disablesleep 1` and puts the
+# previous value back when it stops. A background watcher does that whenever
+# caffeinate exits (timer, command, auto-stop), and stops early on low battery
+# or when the Mac runs hot with the lid closed.
+#
+# With /etc/sudoers.d/awake installed, none of this needs a password.
+#
+# State, in ~/.cache/awake:
+#   caffeinate.pid      exists exactly while awake is on (the toggle reads it)
+#   watch.pid           the watcher
+#   prev_sleepdisabled  SleepDisabled from before awake changed it
+#   last_stop           when and why awake last turned off
+#   session             mode, end time and label, for status and stop reasons
+
+zmodload zsh/datetime zsh/system zsh/zselect || exit 1
+zmodload -F zsh/files b:zf_mkdir b:zf_mv b:zf_rm || exit 1
+setopt extended_glob no_bg_nice
+
+typeset -r SELF=${0:A} NAME=${0:t}
+typeset -r STATE=$HOME/.cache/awake
+typeset -r PIDFILE=$STATE/caffeinate.pid WATCHFILE=$STATE/watch.pid \
+  PREVFILE=$STATE/prev_sleepdisabled LASTFILE=$STATE/last_stop \
+  SESSIONFILE=$STATE/session LOCKFILE=$STATE/lock LOGFILE=$STATE/watch.log
+typeset -r PMSET=/usr/bin/pmset SUDO=/usr/bin/sudo
+typeset -ra THERMAL=(nominal moderate heavy trapping sleeping)
+
+# setting NAME DEFAULT: REPLY = $AWAKE_NAME if that's a number, else DEFAULT
+setting() {
+  local var=AWAKE_$1
+  REPLY=${(P)var:-$2}
+  [[ $REPLY == <->(|.<->) ]] && return
+  print -ru2 -- "awake: ignoring $var=$REPLY (not a number)"
+  REPLY=$2
+}
+setting BATTERY_MIN_OPEN 10;   typeset -r BATTERY_MIN_OPEN=$REPLY
+setting BATTERY_MIN_CLOSED 20; typeset -r BATTERY_MIN_CLOSED=$REPLY
+setting TEMP_MAX 40;           typeset -r TEMP_MAX=$REPLY
+setting THERMAL_MAX 1;         typeset -r THERMAL_MAX=$REPLY
+setting HOT_CHECKS 2;          typeset -r HOT_CHECKS=$REPLY
+setting CHECK_INTERVAL 60;     typeset -r CHECK_INTERVAL=$REPLY
+setting POLL_INTERVAL 2;       typeset -r POLL_INTERVAL=$REPLY
+
+say()  { print -r -- "awake: $*" }
+warn() { print -ru2 -- "awake: $*" }
+log()  { local t; strftime -s t '%F %T' $EPOCHSECONDS; print -r -- "$t $*" }
+row()  { printf '  %-11s %s\n' $1 $2 }
+
+usage() {
+  local text="usage: awake [DURATION]       keep the Mac awake, lid closed too, until \`asleep\`
+       awake -- CMD [ARG...]  keep it awake while CMD runs, then exit with its status
+       asleep | awake stop    turn it off and restore lid sleep
+       awake status           show what's going on
+       awake is-on            exit 0 if on, 1 if off
+
+DURATION is like 90s, 45m, 2h or 1h30m; a bare number means minutes.
+
+While it's on, a watcher checks every ${CHECK_INTERVAL}s and turns it off early:
+  on battery at ${BATTERY_MIN_OPEN}% or less with the lid open, ${BATTERY_MIN_CLOSED}% or less with it closed
+  lid closed and the battery at ${TEMP_MAX}°C or more, or thermal pressure at level
+  ${THERMAL_MAX} or worse (0 nominal, 1 moderate, 2 heavy...), on ${HOT_CHECKS} checks in a row
+
+Change those with AWAKE_BATTERY_MIN_OPEN, AWAKE_BATTERY_MIN_CLOSED, AWAKE_TEMP_MAX,
+AWAKE_THERMAL_MAX, AWAKE_HOT_CHECKS and AWAKE_CHECK_INTERVAL (read when awake turns on)."
+  if (( $1 )); then print -ru2 -- $text; else print -r -- $text; fi
+  exit $1
+}
+
+# ---- small helpers ----------------------------------------------------------
+
+# parse_duration STR: REPLY = seconds
+parse_duration() {
+  local s=$1
+  integer total=0
+  if [[ $s == <-> ]]; then
+    total=$(( s * 60 ))
+  elif [[ $s == (<->[hms])## ]]; then
+    while [[ $s =~ '^([0-9]+)([hms])' ]]; do
+      case $match[2] in
+        (h) (( total += match[1] * 3600 )) ;;
+        (m) (( total += match[1] * 60 )) ;;
+        (s) (( total += match[1] )) ;;
+      esac
+      s=${s#$MATCH}
+    done
+  fi
+  (( total > 0 )) || return 1
+  REPLY=$total
+}
+
+# human SECS: REPLY like 1h 30m, 44m 51s, 9s
+human() {
+  integer h=$(( $1 / 3600 )) m=$(( $1 % 3600 / 60 )) s=$(( $1 % 60 ))
+  local -a parts
+  (( h )) && parts+=(${h}h)
+  (( m )) && parts+=(${m}m)
+  (( s && !h )) && parts+=(${s}s)
+  REPLY=${(j: :)parts:-0s}
+}
+
+# put FILE TEXT: write atomically, so readers never see a half-written file
+put() { print -r -- $2 >| $1.$$ && zf_mv -f $1.$$ $1 }
+
+# read_pid FILE: REPLY = the pid stored there
+read_pid() {
+  REPLY=
+  [[ -r $1 ]] || return 1
+  REPLY=$(<$1)
+  REPLY=${REPLY//[^0-9]/}
+  [[ -n $REPLY ]] && (( REPLY > 1 ))
+}
+
+alive()         { kill -0 $1 2>/dev/null }
+is_caffeinate() { alive $1 && [[ $(/bin/ps -o comm= -p $1 2>/dev/null) == (*/|)caffeinate ]] }
+is_watcher()    { alive $1 && [[ $(/bin/ps -o args= -p $1 2>/dev/null) == *' __watch' ]] }
+
+# session_pid: REPLY = pid of the running caffeinate, if awake is on
+session_pid() { read_pid $PIDFILE && is_caffeinate $REPLY }
+
+# read_session: S_MODE (indefinite|timed|command), S_UNTIL, S_OWNER, S_LABEL
+read_session() {
+  S_MODE= S_UNTIL=0 S_OWNER=0 S_LABEL=
+  [[ -r $SESSIONFILE ]] && read -r S_MODE S_UNTIL S_OWNER S_LABEL <$SESSIONFILE
+}
+
+# spawn OUT CMD...: start CMD detached from this shell and its terminal; REPLY = pid
+spawn() {
+  local out=$1; shift
+  ( trap '' HUP; exec "$@" ) </dev/null >$out 2>&1 &!
+  REPLY=$!
+}
+
+# stop_pid PID: TERM, then KILL if it hangs around
+stop_pid() {
+  kill -TERM $1 2>/dev/null || return 0
+  integer i
+  for (( i = 0; i < 30; i++ )); do
+    alive $1 || return 0
+    zselect -t 5
+  done
+  kill -KILL $1 2>/dev/null
+}
+
+# lock [wait]: serialize awake, asleep, the watcher and the toggle.
+# Plain lock gives up after 15s; `lock wait` (the watcher) never does.
+lock() {
+  [[ -n ${LOCKFD-} ]] && return 0
+  zf_mkdir -p $STATE && : >>$LOCKFILE || return 1
+  if [[ ${1-} == wait ]]; then
+    until zsystem flock -t 5 -f LOCKFD $LOCKFILE 2>/dev/null; do :; done
+  elif ! zsystem flock -t 15 -f LOCKFD $LOCKFILE 2>/dev/null; then
+    warn "another awake is busy (waiting for a password?); try again"
+    return 1
+  fi
+}
+unlock() {
+  [[ -n ${LOCKFD-} ]] || return 0
+  zsystem flock -u $LOCKFD
+  unset LOCKFD
+}
+
+notify() {
+  /usr/bin/osascript -e 'on run argv' \
+    -e 'display notification (item 1 of argv) with title "Awake"' \
+    -e 'end run' $1 </dev/null >/dev/null 2>&1 &!
+}
+
+# reload_controls: tell Control Center to re-read the toggle's state
+reload_controls() {
+  local app
+  for app in ${AWAKE_APP:-} ~/Applications/Awake.app /Applications/Awake.app; do
+    [[ -x $app/Contents/MacOS/Awake ]] || continue
+    spawn /dev/null $app/Contents/MacOS/Awake --reload
+    return
+  done
+}
+
+# ---- lid sleep ---------------------------------------------------------------
+
+# sleep_disabled: REPLY = SleepDisabled now (pmset only lists it while it's 1)
+sleep_disabled() {
+  local out
+  out=$($PMSET -g 2>/dev/null) || { REPLY=; return 1 }
+  if [[ $out =~ 'SleepDisabled[[:space:]]+([01])' ]]; then REPLY=$match[1]; else REPLY=0; fi
+}
+
+# set_sleep_disabled 0|1 [ask]: via the sudoers rule; with ask, fall back to a password prompt
+set_sleep_disabled() {
+  $SUDO -n $PMSET -a disablesleep $1 2>/dev/null && return
+  [[ ${2-} == ask ]] && { : </dev/tty } 2>/dev/null || return 1
+  $SUDO -p "awake: password for %u to change lid sleep: " $PMSET -a disablesleep $1 </dev/tty
+}
+
+# restore_lid_sleep [ask]: put SleepDisabled back to its value from before awake.
+# RESTORED = restored | kept (already right) | failed | none (nothing saved)
+restore_lid_sleep() {
+  RESTORED=none PREV=
+  [[ -f $PREVFILE ]] || return 0
+  PREV=$(<$PREVFILE)
+  if [[ $PREV != [01] ]]; then
+    warn "can't read $PREVFILE; leaving SleepDisabled as it is"
+    zf_rm -f $PREVFILE
+    return 0
+  fi
+  sleep_disabled
+  if [[ $REPLY == $PREV ]]; then
+    RESTORED=kept
+  elif set_sleep_disabled $PREV ${1-}; then
+    RESTORED=restored
+  else
+    RESTORED=failed
+    return 1
+  fi
+  zf_rm -f $PREVFILE
+}
+
+# sudoers_ok: is the NOPASSWD rule for pmset installed?
+sudoers_ok() {
+  local out
+  out=$($SUDO -n -l 2>/dev/null) || return 1
+  [[ $out == *NOPASSWD:*"$PMSET -a disablesleep 0"* && $out == *NOPASSWD:*"$PMSET -a disablesleep 1"* ]]
+}
+
+explain_sudo() {
+  local why="sudo needs a password"
+  { : </dev/tty } 2>/dev/null || why+=" and there's no terminal to ask in"
+  warn "couldn't $1: $why."
+  warn "install the sudoers rule, as /etc/sudoers.d/awake (mode 0440), so it never asks:"
+  warn "  $USERNAME ALL=(root) NOPASSWD: $PMSET -a disablesleep 0, $PMSET -a disablesleep 1"
+}
+
+# ---- power -------------------------------------------------------------------
+
+# read_power: POWER (ac|battery), PCT, TEMP (°C), LEVEL (thermal pressure), LID (open|closed)
+read_power() {
+  local out
+  POWER= PCT= TEMP= LEVEL= LID=
+  out=$($PMSET -g batt 2>/dev/null)
+  case $out in
+    (*"'AC Power'"*) POWER=ac ;;
+    (*"'Battery Power'"*) POWER=battery ;;
+  esac
+  [[ $out =~ '([0-9]+)%;' ]] && PCT=$match[1]
+  out=$(/usr/sbin/ioreg -rn AppleSmartBattery 2>/dev/null)
+  [[ $out =~ '"Temperature" = ([0-9]+)' ]] && printf -v TEMP '%.1f' $(( match[1] / 100.0 ))
+  out=$(/usr/sbin/ioreg -r -k AppleClamshellState -d 1 2>/dev/null)
+  [[ $out =~ '"AppleClamshellState" = (Yes|No)' ]] && LID=${${match[1]/Yes/closed}/No/open}
+  out=$(/usr/bin/notifyutil -g com.apple.system.thermalpressurelevel 2>/dev/null)
+  [[ $out =~ ' ([0-9]+)$' ]] && LEVEL=$match[1]
+}
+
+# low_battery: REPLY = why, when the battery is too low to stay awake (stop at once)
+low_battery() {
+  [[ $POWER == battery && -n $PCT ]] || return 1
+  if [[ $LID == closed ]]; then
+    (( PCT <= BATTERY_MIN_CLOSED )) || return 1
+    REPLY="battery at $PCT% with the lid closed (limit $BATTERY_MIN_CLOSED%)"
+  else
+    (( PCT <= BATTERY_MIN_OPEN )) || return 1
+    REPLY="battery at $PCT% (limit $BATTERY_MIN_OPEN%)"
+  fi
+}
+
+# too_hot: REPLY = why, when the lid is closed and the Mac runs hot (stop on repeat)
+too_hot() {
+  [[ $LID == closed ]] || return 1
+  local -a why
+  [[ -n $TEMP ]] && (( TEMP >= TEMP_MAX )) && why+=("battery at $TEMP°C (limit $TEMP_MAX°C)")
+  [[ -n $LEVEL ]] && (( LEVEL >= THERMAL_MAX )) && why+=("thermal pressure ${THERMAL[LEVEL+1]:-level $LEVEL}")
+  (( $#why )) || return 1
+  REPLY="lid closed and ${(j:, :)why}"
+}
+
+# ---- sessions ----------------------------------------------------------------
+
+# start MODE SECONDS LABEL: turn awake on, or replace the session that's running.
+# Sets STARTED (caffeinate pid, empty if it was already on) and REPLACED.
+start() {
+  local mode=$1 label=$3 old= pid
+  integer secs=$2
+  local -a args=(-ims)
+  case $mode in
+    (timed) args+=(-t $secs) ;;
+    (command) args+=(-w $$) ;;
+  esac
+  STARTED= REPLACED=
+
+  lock || return 1
+  session_pid && old=$REPLY
+  if [[ -n $old && $mode == indefinite ]]; then
+    read_session
+    if [[ $S_MODE == indefinite ]]; then
+      ensure_watcher
+      unlock
+      return 0
+    fi
+  fi
+
+  read_power
+  if low_battery; then
+    unlock
+    warn "not turning on: $REPLY"
+    return 1
+  fi
+
+  # Remember SleepDisabled as it was before awake; a stale value from a session
+  # that never restored it is still the right one to go back to.
+  if [[ ! -f $PREVFILE ]]; then
+    if ! sleep_disabled; then
+      unlock
+      warn "can't read SleepDisabled from pmset"
+      return 1
+    fi
+    put $PREVFILE $REPLY
+  fi
+  sleep_disabled
+  if [[ $REPLY != 1 ]] && ! set_sleep_disabled 1 ask; then
+    [[ -z $old ]] && zf_rm -f $PREVFILE
+    unlock
+    explain_sudo "disable lid sleep"
+    return 3
+  fi
+
+  spawn /dev/null /usr/bin/caffeinate $args
+  pid=$REPLY
+  zselect -t 10
+  if ! alive $pid; then
+    [[ -z $old ]] && restore_lid_sleep
+    unlock
+    warn "caffeinate didn't start"
+    return 1
+  fi
+  put $PIDFILE $pid
+  put $SESSIONFILE "$mode $(( secs ? EPOCHSECONDS + secs : 0 )) $$ $label"
+  [[ -n $old ]] && stop_pid $old
+  ensure_watcher
+  unlock
+  reload_controls
+  STARTED=$pid REPLACED=$old
+}
+
+# end_session REASON KIND [PID]: stop caffeinate, restore lid sleep, record why.
+#   KIND manual may ask for a password; KIND auto never does, and notifies.
+#   With PID, only if that caffeinate is still the session (returns 2 if not).
+#   Call with the lock held.
+end_session() {
+  local reason=$1 kind=$2 expect=${3-} pid= note= t
+  if read_pid $PIDFILE; then
+    pid=$REPLY
+    [[ -n $expect && $pid != $expect ]] && return 2
+  elif [[ -n $expect ]]; then
+    return 2
+  fi
+  ENDING=1
+  [[ -n $pid ]] && is_caffeinate $pid && stop_pid $pid
+  zf_rm -f $PIDFILE $SESSIONFILE
+  restore_lid_sleep ${${kind:#auto}:+ask}
+  strftime -s t '%F %T' $EPOCHSECONDS
+  put $LASTFILE "$t  $reason"
+  if [[ $kind == auto ]]; then
+    case $RESTORED in
+      (restored) note=" Lid sleep is back on." ;;
+      (failed) note=" Lid sleep is still disabled: run asleep to restore it." ;;
+    esac
+    notify "Off: $reason.$note"
+  fi
+  ENDING=0
+  [[ $RESTORED != failed ]]
+}
+
+ensure_watcher() {
+  read_pid $WATCHFILE && is_watcher $REPLY && return
+  spawn $LOGFILE /bin/zsh -f $SELF __watch
+  put $WATCHFILE $REPLY
+}
+
+# stop_watcher: deregister the watcher (lock held); it exits once it notices
+stop_watcher() {
+  read_pid $WATCHFILE || return 0
+  local w=$REPLY
+  zf_rm -f $WATCHFILE
+  (( w != $$ )) && is_watcher $w && kill -TERM $w 2>/dev/null
+  return 0
+}
+
+stop_reason() { REPLY=${AWAKE_CALLER:+"turned off from $AWAKE_CALLER"}; REPLY=${REPLY:-"stopped by $1"} }
+
+# ---- commands ----------------------------------------------------------------
+
+cmd_on() {
+  local mode=indefinite label= until
+  integer secs=0 rc
+  if (( $# )); then
+    parse_duration $1 || { warn "not a duration: $1 (try 90s, 45m, 2h or 1h30m)"; exit 2 }
+    secs=$REPLY mode=timed
+    human $secs; label=$REPLY
+  fi
+  start $mode $secs "$label"; rc=$?
+  (( rc )) && exit $rc
+  if [[ -z $STARTED ]]; then
+    say "already on, until asleep"
+  elif [[ $mode == timed ]]; then
+    strftime -s until '%H:%M' $(( EPOCHSECONDS + secs ))
+    say "on for $label, until $until${REPLACED:+ (replaces the previous session)}"
+  else
+    say "on until asleep${REPLACED:+ (replaces the previous session)}"
+  fi
+}
+
+cmd_run() {
+  local label=${(j: :)${(q-)@}} mine sig
+  integer rc
+  start command 0 "$label" || exit 125
+  mine=$STARTED
+  [[ -t 2 ]] && warn "on while this runs"
+
+  # Ctrl-C and friends reach the command; we clean up once it's gone.
+  trap : INT TERM HUP QUIT
+  command "$@"
+  rc=$?
+
+  if lock; then
+    end_session "$label finished (exit $rc)" auto $mine
+    (( $? != 2 )) && stop_watcher
+    unlock
+    reload_controls
+  fi
+  if (( rc > 128 )) && sig=${signals[rc-127]-} && [[ $sig == (INT|TERM|HUP|QUIT) ]]; then
+    trap - $sig
+    kill -$sig $$
+  fi
+  exit $rc
+}
+
+cmd_stop() {
+  local reason=$1 rc=0
+  lock || exit 1
+  if ! read_pid $PIDFILE && [[ ! -f $PREVFILE ]]; then
+    stop_watcher
+    unlock
+    reload_controls
+    say "already off"
+    return 0
+  fi
+  end_session "$reason" manual || rc=3
+  stop_watcher
+  unlock
+  reload_controls
+  case $RESTORED in
+    (restored) say "off, lid sleep restored" ;;
+    (kept) [[ $PREV == 1 ]] && say "off (lid sleep stays disabled, as it was before awake)" || say "off, lid sleep restored" ;;
+    (none) say "off" ;;
+    (failed) explain_sudo "restore lid sleep (SleepDisabled is still 1); awake is off" ;;
+  esac
+  return $rc
+}
+
+cmd_status() {
+  local pid= line t cur prev=
+  integer left
+  if session_pid; then
+    pid=$REPLY
+    read_session
+    case $S_MODE in
+      (timed)
+        left=$(( S_UNTIL - EPOCHSECONDS ))
+        strftime -s t '%H:%M' $S_UNTIL
+        if (( left > 0 )); then human $left; line="on, $REPLY left (until $t)"; else line="on, timer just ran out"; fi ;;
+      (command) line="on while this runs: $S_LABEL" ;;
+      (*) line="on until asleep" ;;
+    esac
+  else
+    line=off
+  fi
+  print -r -- "awake: $line"
+
+  if [[ -n $pid ]]; then
+    row caffeinate "pid $pid"
+    if read_pid $WATCHFILE && is_watcher $REPLY; then
+      row watcher "pid $REPLY, checks every ${CHECK_INTERVAL}s"
+    else
+      row watcher "not running: run awake again to restart it"
+    fi
+  elif read_pid $PIDFILE; then
+    row note "a session ended without cleaning up: run asleep"
+  fi
+
+  sleep_disabled; cur=$REPLY
+  [[ -f $PREVFILE ]] && prev=$(<$PREVFILE)
+  if [[ $cur == 1 ]]; then
+    line="disabled (SleepDisabled 1${prev:+, restores to $prev})"
+    [[ -z $pid && -n $prev ]] && line+=", left over: run asleep"
+  else
+    line="enabled (SleepDisabled ${cur:-?})"
+  fi
+  row "lid sleep" $line
+
+  read_power
+  local -a p
+  case $POWER in
+    (ac) p+=("AC power"); [[ -n $PCT ]] && p+=("battery $PCT%") ;;
+    (battery) p+=("on battery, $PCT%") ;;
+  esac
+  [[ -n $TEMP ]] && p+=("$TEMP°C")
+  [[ -n $LEVEL ]] && p+=("thermal ${THERMAL[LEVEL+1]:-level $LEVEL}")
+  [[ -n $LID ]] && p+=("lid $LID")
+  row power "${(j:, :)p}"
+
+  if sudoers_ok; then
+    row sudoers "rule installed"
+  else
+    row sudoers "rule missing: awake asks for a password, the watcher can't restore lid sleep"
+  fi
+  [[ -r $LASTFILE ]] && row "last stop" "$(<$LASTFILE)"
+  return 0
+}
+
+# ---- watcher -----------------------------------------------------------------
+
+registered() { read_pid $WATCHFILE && (( REPLY == $$ )) }
+
+# exit_reason: REPLY = why caffeinate exited on its own
+exit_reason() {
+  read_session
+  case $S_MODE in
+    (timed) (( EPOCHSECONDS >= S_UNTIL - 5 )) && { REPLY="timer finished ($S_LABEL)"; return } ;;
+    (command) alive $S_OWNER || { REPLY="awake -- $S_LABEL went away"; return } ;;
+  esac
+  REPLY="caffeinate exited unexpectedly"
+}
+
+# watcher_end REASON [PID]: end the session (if PID is still it) and exit
+watcher_end() {
+  lock wait
+  registered || exit 0
+  end_session "$1" auto ${2-}
+  if (( $? != 2 )); then
+    log "off: $1 (lid sleep: $RESTORED)"
+    stop_watcher
+    unlock
+    reload_controls
+    exit 0
+  fi
+  unlock
+}
+
+on_watcher_term() {
+  (( ${ENDING:-0} )) && return
+  registered || exit 0
+  watcher_end "the watcher was stopped (logout or kill)"
+  exit 0
+}
+
+cmd_watch() {
+  local pid
+  integer strikes=0 next poll=$(( POLL_INTERVAL * 100 ))
+  (( poll >= 10 )) || poll=10
+  trap on_watcher_term TERM
+  lock wait; unlock   # the awake that spawned us registers us under the lock
+  log "watching (poll ${POLL_INTERVAL}s, checks every ${CHECK_INTERVAL}s)"
+  next=$(( EPOCHSECONDS + CHECK_INTERVAL ))
+
+  while :; do
+    registered || { log "replaced"; exit 0 }
+    if ! read_pid $PIDFILE; then
+      lock wait
+      if registered && ! read_pid $PIDFILE; then
+        zf_rm -f $WATCHFILE
+        unlock
+        log "session ended"
+        exit 0
+      fi
+      unlock
+      continue
+    fi
+    pid=$REPLY
+
+    if ! alive $pid; then
+      exit_reason
+      watcher_end "$REPLY" $pid
+      continue
+    fi
+
+    if (( EPOCHSECONDS >= next )); then
+      next=$(( EPOCHSECONDS + CHECK_INTERVAL ))
+      read_power
+      if low_battery; then
+        watcher_end "$REPLY" $pid
+      elif too_hot; then
+        log "hot, check $(( ++strikes ))/$HOT_CHECKS: $REPLY"
+        (( strikes >= HOT_CHECKS )) && watcher_end "$REPLY" $pid
+      else
+        (( strikes )) && log "cooled down"
+        strikes=0
+      fi
+    fi
+    zselect -t $poll
+  done
+}
+
+# ---- main --------------------------------------------------------------------
+
+main() {
+  (( EUID )) || { warn "run awake as yourself, not as root"; exit 1 }
+  if [[ $NAME == asleep ]]; then
+    (( $# )) && usage 2
+    stop_reason asleep; cmd_stop $REPLY; exit
+  fi
+  case ${1-} in
+    ('') cmd_on ;;
+    (--) shift; (( $# )) || usage 2; cmd_run "$@" ;;
+    (stop) (( $# == 1 )) || usage 2; stop_reason "awake stop"; cmd_stop $REPLY; exit ;;
+    (status) cmd_status ;;
+    (is-on) session_pid; exit ;;
+    (-h|--help|help) usage 0 ;;
+    (__watch) cmd_watch ;;
+    (*) (( $# == 1 )) || usage 2; cmd_on $1 ;;
+  esac
+}
+
+[[ $ZSH_EVAL_CONTEXT == toplevel ]] && main "$@"

@@ -1,0 +1,3 @@
+# /etc/sudoers.d/awake: lets `awake`, `asleep`, the watcher and the Control
+# Center toggle switch lid sleep without a password. These two commands only.
+mohdkhan ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1
